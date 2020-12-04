@@ -18,6 +18,10 @@
 #include <Utopia/Core/Components/Components.h>
 #include <Utopia/Core/Systems/Systems.h>
 
+#ifndef NDEBUG
+#include <dxgidebug.h>
+#endif
+
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
@@ -88,10 +92,11 @@ private:
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
     PSTR cmdLine, int showCmd)
 {
-    // Enable run-time memory check for debug builds.
+	// Enable run-time memory check for debug builds.
 #if defined(DEBUG) | defined(_DEBUG)
-    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
+	int rst;
 
     try
     {
@@ -99,17 +104,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
         if(!theApp.Initialize())
             return 0;
 
-        int rst = theApp.Run();
-		Ubpa::Utopia::RsrcMngrDX12::Instance().Clear();
-		return rst;
+        rst = theApp.Run();
     }
     catch(Ubpa::UDX12::Util::Exception& e)
     {
 		MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
-		Ubpa::Utopia::RsrcMngrDX12::Instance().Clear();
-        return 0;
+		rst = 1;
     }
 
+#ifndef NDEBUG
+	Microsoft::WRL::ComPtr<IDXGIDebug> debug;
+	DXGIGetDebugInterface1(0, IID_PPV_ARGS(&debug));
+	if (debug)
+		debug->ReportLiveObjects(DXGI_DEBUG_ALL, DXGI_DEBUG_RLO_DETAIL);
+#endif
+
+	return 1;
 }
 
 WorldApp::WorldApp(HINSTANCE hInstance)
@@ -119,8 +129,9 @@ WorldApp::WorldApp(HINSTANCE hInstance)
 
 WorldApp::~WorldApp()
 {
+	Ubpa::Utopia::RsrcMngrDX12::Instance().Clear(uCmdQueue.Get());
     if(!uDevice.IsNull())
-        FlushCommandQueue();
+		FlushCommandQueue();
 }
 
 bool WorldApp::Initialize() {
@@ -148,30 +159,18 @@ bool WorldApp::Initialize() {
 	BuildWorld();
 
 	ThrowIfFailed(uGCmdList->Reset(mDirectCmdListAlloc.Get(), nullptr));
-	auto& upload = Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload();
-	auto& deleteBatch = Ubpa::Utopia::RsrcMngrDX12::Instance().GetDeleteBatch();
-
-	upload.Begin();
 
 	LoadTextures();
 	BuildShaders();
 	BuildMaterials();
 
 	// update mesh
-	world.RunEntityJob([&](const Ubpa::Utopia::MeshFilter* meshFilter) {
+	world.RunEntityJob([&](Ubpa::Utopia::MeshFilter* meshFilter) {
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterMesh(
-			upload,
-			deleteBatch,
 			uGCmdList.Get(),
 			*meshFilter->mesh
 		);
 	}, false);
-
-	// commit upload, delete ...
-	upload.End(uCmdQueue.raw.Get());
-	uGCmdList->Close();
-	uCmdQueue.Execute(uGCmdList.raw.Get());
-	deleteBatch.Commit(uDevice.raw.Get(), uCmdQueue.raw.Get());
 
 	Ubpa::Utopia::PipelineBase::InitDesc initDesc;
 	initDesc.device = uDevice.raw.Get();
@@ -179,6 +178,12 @@ bool WorldApp::Initialize() {
 	initDesc.cmdQueue = uCmdQueue.raw.Get();
 	initDesc.numFrame = gNumFrameResources;
 	pipeline = std::make_unique<Ubpa::Utopia::StdPipeline>(initDesc);
+
+	// commit upload, delete ...
+	uGCmdList->Close();
+	uCmdQueue.Execute(uGCmdList.raw.Get());
+
+	Ubpa::Utopia::RsrcMngrDX12::Instance().CommitUploadAndDelete(uCmdQueue.raw.Get());
 
 	// Do the initial resize code.
 	OnResize();
@@ -198,9 +203,6 @@ void WorldApp::OnResize() {
 
 void WorldApp::Update()
 {
-	auto& upload = Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload();
-	upload.Begin();
-
 	UpdateCamera();
 
 	world.Update();
@@ -211,15 +213,12 @@ void WorldApp::Update()
 	auto cmdAlloc = frameRsrcMngr->GetCurrentFrameResource()->GetResource<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>>("CommandAllocator");
 	cmdAlloc->Reset();
 	ThrowIfFailed(uGCmdList->Reset(cmdAlloc.Get(), nullptr));
-	auto& deleteBatch = Ubpa::Utopia::RsrcMngrDX12::Instance().GetDeleteBatch();
 
-	world.RunEntityJob([&](const Ubpa::Utopia::MeshFilter* meshFilter, const Ubpa::Utopia::MeshRenderer* meshRenderer) {
+	world.RunEntityJob([&](Ubpa::Utopia::MeshFilter* meshFilter, const Ubpa::Utopia::MeshRenderer* meshRenderer) {
 		if (!meshFilter->mesh || meshRenderer->materials.empty())
 			return;
 
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterMesh(
-			upload,
-			deleteBatch,
 			uGCmdList.Get(),
 			*meshFilter->mesh
 		);
@@ -230,13 +229,11 @@ void WorldApp::Update()
 			for (const auto& [name, property] : material->properties) {
 				if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)) {
 					Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTexture2D(
-						Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 						*std::get<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)
 					);
 				}
 				else if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)) {
 					Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTextureCube(
-						Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 						*std::get<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)
 					);
 				}
@@ -248,13 +245,11 @@ void WorldApp::Update()
 		for (const auto& [name, property] : skybox->material->properties) {
 			if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)) {
 				Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTexture2D(
-					Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 					*std::get<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)
 				);
 			}
 			else if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)) {
 				Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTextureCube(
-					Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 					*std::get<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)
 				);
 			}
@@ -262,10 +257,9 @@ void WorldApp::Update()
 	}
 
 	// commit upload, delete ...
-	upload.End(uCmdQueue.raw.Get());
 	uGCmdList->Close();
 	uCmdQueue.Execute(uGCmdList.raw.Get());
-	deleteBatch.Commit(uDevice.raw.Get(), uCmdQueue.raw.Get());
+	Ubpa::Utopia::RsrcMngrDX12::Instance().CommitUploadAndDelete(uCmdQueue.raw.Get());
 	frameRsrcMngr->EndFrame(uCmdQueue.raw.Get());
 
 	std::vector<Ubpa::Utopia::PipelineBase::CameraData> gameCameras;
@@ -350,7 +344,7 @@ void WorldApp::UpdateCamera()
 }
 
 void WorldApp::BuildWorld() {
-	world.systemMngr.Register<
+	auto systemIDs = world.systemMngr.systemTraits.Register<
 		Ubpa::Utopia::CameraSystem,
 		Ubpa::Utopia::LocalToParentSystem,
 		Ubpa::Utopia::RotationEulerSystem,
@@ -359,6 +353,8 @@ void WorldApp::BuildWorld() {
 		Ubpa::Utopia::WorldToLocalSystem,
 		RotateSystem
 	>();
+	for (auto ID : systemIDs)
+		world.systemMngr.Activate(ID);
 
 	{ // skybox
 		auto [e, skybox] = world.entityMngr.Create<Ubpa::Utopia::Skybox>();
@@ -405,7 +401,6 @@ void WorldApp::LoadTextures() {
 	for (const auto& guid : tex2dGUIDs) {
 		const auto& path = Ubpa::Utopia::AssetMngr::Instance().GUIDToAssetPath(guid);
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTexture2D(
-			Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 			*Ubpa::Utopia::AssetMngr::Instance().LoadAsset<Ubpa::Utopia::Texture2D>(path)
 		);
 	}
@@ -414,7 +409,6 @@ void WorldApp::LoadTextures() {
 	for (const auto& guid : texcubeGUIDs) {
 		const auto& path = Ubpa::Utopia::AssetMngr::Instance().GUIDToAssetPath(guid);
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTextureCube(
-			Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 			*Ubpa::Utopia::AssetMngr::Instance().LoadAsset<Ubpa::Utopia::TextureCube>(path)
 		);
 	}

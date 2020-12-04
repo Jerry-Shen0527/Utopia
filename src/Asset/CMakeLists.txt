@@ -1,17 +1,11 @@
-# ushader
-set(target_dir "${PROJECT_SOURCE_DIR}/src/Asset/ShaderCompiler/_deps")
-if(NOT EXISTS ${target_dir})
-  Ubpa_ANTLR4Generate(
-    GEN_VISITOR
-	GEN_LISTENER
-	G4 "${PROJECT_SOURCE_DIR}/cmake/Shader.g4"
-	NAMESPACE Ubpa::Utopia::details
-	DIR ${target_dir}
-  )
-endif()
+Ubpa_DownloadZip_Pro(
+  https://cdn.jsdelivr.net/gh/Ubpa/UData@master/Utopia/ushader/UShaderCompiler_deps_20201122.zip
+  UShaderCompiler_deps_20201122.zip
+  ${CMAKE_CURRENT_SOURCE_DIR}/UShaderCompiler/_deps
+  SHA256 2B5531D579A1C665A7D7EA1FE396D8F62D6043CCB2A88890ED42FD19B858AE0D
+)
 
 # deps
-
 set(libs "")
 set(defines "")
 
@@ -23,11 +17,11 @@ else()
   message(STATUS "[Utopia/Asset] not found assimp")
 endif()
 
+# target
 Ubpa_AddTarget(
   MODE STATIC
   SOURCE
     "${PROJECT_SOURCE_DIR}/include/Utopia/Asset"
-    "${PROJECT_SOURCE_DIR}/cmake/Shader.g4"
 	${ushader_parser_files}
   INC
     "${PROJECT_SOURCE_DIR}/include"

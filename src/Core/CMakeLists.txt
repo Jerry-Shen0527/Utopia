@@ -15,11 +15,13 @@ set(components
   Input
   LocalToParent
   LocalToWorld
+  Name
   Parent
   Roamer
   Rotation
   RotationEuler
   Scale
+  NonUniformScale
   Translation
   WorldTime
   WorldToLocal

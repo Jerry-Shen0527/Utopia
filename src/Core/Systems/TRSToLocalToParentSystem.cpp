@@ -3,17 +3,23 @@
 #include <Utopia/Core/Components/LocalToParent.h>
 #include <Utopia/Core/Components/Rotation.h>
 #include <Utopia/Core/Components/Scale.h>
+#include <Utopia/Core/Components/NonUniformScale.h>
 #include <Utopia/Core/Components/Translation.h>
+#include <Utopia/Core/Components/Parent.h>
 
 using namespace Ubpa::Utopia;
 
 void TRSToLocalToParentSystem::OnUpdate(UECS::Schedule& schedule) {
 	UECS::ArchetypeFilter filter;
-	filter.all = { UECS::CmptAccessType::Of<UECS::Write<LocalToParent>> };
+	filter.all = {
+		UECS::CmptAccessType::Of<UECS::Write<LocalToParent>>,
+		UECS::CmptAccessType::Of<UECS::Latest<Parent>>
+	};
 	filter.any = {
 		UECS::CmptAccessType::Of<UECS::Latest<Translation>>,
 		UECS::CmptAccessType::Of<UECS::Latest<Rotation>>,
 		UECS::CmptAccessType::Of<UECS::Latest<Scale>>,
+		UECS::CmptAccessType::Of<UECS::Latest<NonUniformScale>>,
 	};
 
 	schedule.RegisterChunkJob([](UECS::ChunkView chunk) {
@@ -21,44 +27,30 @@ void TRSToLocalToParentSystem::OnUpdate(UECS::Schedule& schedule) {
 		auto chunkT = chunk.GetCmptArray<Translation>();
 		auto chunkR = chunk.GetCmptArray<Rotation>();
 		auto chunkS = chunk.GetCmptArray<Scale>();
+		auto chunkNUS = chunk.GetCmptArray<NonUniformScale>();
 
-		bool containsT = chunkT != nullptr;
-		bool containsR = chunkR != nullptr;
-		bool containsS = chunkS != nullptr;
+		bool containsT = !chunkT.empty();
+		bool containsR = !chunkR.empty();
+		bool containsS = !chunkS.empty() || !chunkNUS.empty();
+		assert(containsT || containsR || containsS);
 
 		for (size_t i = 0; i < chunk.EntityNum(); i++) {
-			// 000
-			if (!containsT && !containsR && !containsS) {
-				assert(false);
-			}
-			// 001
-			else if (!containsT && !containsR && containsS) {
-				chunkL2P[i].value = transformf{ chunkS[i].value };
-			}
-			// 010
-			else if (!containsT && containsR && !containsS) {
-				chunkL2P[i].value = transformf{ chunkR[i].value };
-			}
-			// 011
-			else if (!containsT && containsR && containsS) {
-				chunkL2P[i].value = transformf{ chunkR[i].value, chunkS[i].value };
-			}
-			// 100
-			else if (containsT && !containsR && !containsS) {
-				chunkL2P[i].value = transformf{ chunkT[i].value };
-			}
-			// 101
-			else if (containsT && !containsR && containsS) {
-				chunkL2P[i].value = transformf{ chunkT[i].value, scalef3{chunkS[i].value} };
-			}
-			// 110
-			else if (containsT && containsR && !containsS) {
-				chunkL2P[i].value = transformf{ chunkT[i].value, chunkR[i].value };
-			}
-			// 111
-			else/* if (containsT && containsR && containsS)*/ {
-				chunkL2P[i].value = transformf{ chunkT[i].value, chunkR[i].value, scalef3{chunkS[i].value} };
-			}
+			scalef3 s = !chunkS.empty() ? chunkS[i].value : 1.f;
+			if (!chunkNUS.empty())
+				s *= chunkNUS[i].value;
+
+			// 00
+			if (!containsT && !containsR)
+				chunkL2P[i].value = transformf{ s };
+			// 01
+			else if (!containsT && containsR)
+				chunkL2P[i].value = transformf{ chunkR[i].value, s };
+			// 10
+			else if (containsT && !containsR)
+				chunkL2P[i].value = transformf{ chunkT[i].value, s };
+			// 11
+			else // if (containsT && containsR)
+				chunkL2P[i].value = transformf{ chunkT[i].value, chunkR[i].value, s };
 		}
 	}, SystemFuncName, filter);
 }

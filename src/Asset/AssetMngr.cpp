@@ -1,6 +1,6 @@
 #include <Utopia/Asset/AssetMngr.h>
 
-#include "ShaderCompiler/ShaderCompiler.h"
+#include "UShaderCompiler/UShaderCompiler.h"
 
 #include <Utopia/Asset/Serializer.h>
 
@@ -328,7 +328,7 @@ std::shared_ptr<Object> AssetMngr::LoadAsset(const std::filesystem::path& path) 
 	}
 	else if (ext == ".shader") {
 		auto shaderText = Impl::LoadText(path);
-		auto [success, rstShader] = ShaderCompiler::Instance().Compile(shaderText);
+		auto [success, rstShader] = UShaderCompiler::Instance().Compile(shaderText);
 		if (!success)
 			return nullptr;
 		auto shader = std::make_shared<Shader>(std::move(rstShader));
@@ -677,7 +677,6 @@ rapidjson::Document AssetMngr::Impl::LoadJSON(const std::filesystem::path& metap
 	return doc;
 }
 
-
 std::shared_ptr<Mesh> AssetMngr::Impl::BuildMesh(MeshContext ctx) {
 	auto mesh = std::make_shared<Mesh>();
 	mesh->SetPositions(std::move(ctx.positions));
@@ -697,7 +696,6 @@ std::shared_ptr<Mesh> AssetMngr::Impl::BuildMesh(MeshContext ctx) {
 	if (mesh->GetTangents().empty())
 		mesh->GenTangents();
 
-	mesh->UpdateVertexBuffer();
 	mesh->SetToNonEditable();
 
 	return mesh;

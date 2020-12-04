@@ -1,6 +1,12 @@
 #ifndef STD_PIEPELINE_HLSLI
 #define STD_PIEPELINE_HLSLI
 
+// [ configuration ] define before include
+// 1. STD_PIPELINE_ENABLE_LTC
+// - 1. STD_PIPELINE_LTC_RECT_SPHEXE_APPROX
+
+#include "StdPipeline_details.hlsli"
+
 // standard pipeline static samplers
 SamplerState gSamplerPointWrap  : register(s0);
 SamplerState gSamplerLinearWrap : register(s2);
@@ -64,8 +70,10 @@ cbuffer StdPipeline_cbPerCamera : register(b##x) \
 // color
 // position
 // dir
+// horizontal
 // range
-// radius : f0
+// width  : f0
+// height : f1
 
 #define STD_PIPELINE_CB_LIGHT_ARRAY(x)            \
 struct Light {                                    \
@@ -92,21 +100,28 @@ cbuffer StdPipeline_cbLightArray : register(b##x) \
 	Light gLights[16];                            \
 }
 
-// cover 3 register
-#define STD_PIPELINE_SR_IBL(x)                            \
+#define STD_PIPELINE_SR3_IBL(x)                           \
 TextureCube StdPipeline_IrradianceMap : register(t[x  ]); \
 TextureCube StdPipeline_PreFilterMap  : register(t[x+1]); \
-Texture2D   StdPipeline_BRDFLUT       : register(t[x+2])
-
-#define STD_PIPELINE_PREFILTER_MIP_LEVEL 4
+Texture2D   StdPipeline_BRDFLUT       : register(t[x+2]); \
+static const uint StdPipeline_MaxMipLevel = 4
 
 #define STD_PIPELINE_SAMPLE_PREFILTER(R, roughness) \
-StdPipeline_PreFilterMap.SampleLevel(gSamplerLinearWrap, R, roughness * STD_PIPELINE_PREFILTER_MIP_LEVEL).rgb
+StdPipeline_PreFilterMap.SampleLevel(gSamplerLinearWrap, R, roughness * StdPipeline_MaxMipLevel).rgb
 
 #define STD_PIPELINE_SAMPLE_BRDFLUT(NdotV, roughness) \
 StdPipeline_BRDFLUT.Sample(gSamplerLinearWrap, float2(NdotV, roughness)).rg
 
 #define STD_PIPELINE_SAMPLE_IRRADIANCE(N) \
 StdPipeline_IrradianceMap.Sample(gSamplerLinearWrap, N).rgb
+
+#ifdef STD_PIPELINE_ENABLE_LTC
+#define STD_PIPELINE_SR2_LTC(x)                  \
+/* GGX m(0,0) m(2,0) m(0,2) m(2,2) */            \
+Texture2D StdPipeline_LTC0 : register(t[x    ]); \
+/* GGX norm, fresnel, 0(unused), sphere */       \
+Texture2D StdPipeline_LTC1 : register(t[x + 1]); \
+STD_PIPELINE_LTC_SAMPLE_DEFINE
+#endif // STD_PIPELINE_ENABLE_LTC
 
 #endif // STD_PIEPELINE_HLSLI

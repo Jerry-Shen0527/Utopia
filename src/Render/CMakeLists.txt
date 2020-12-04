@@ -3,7 +3,6 @@ set(components
   MeshFilter
   MeshRenderer
   Skybox
-  Light
 )
 
 set(refls "")
@@ -16,6 +15,13 @@ foreach(cmpt ${components})
   )
   list(APPEND refls ${dst})
 endforeach()
+
+Ubpa_DownloadZip_Pro(
+  https://cdn.jsdelivr.net/gh/Ubpa/UData@master/Utopia/LTCTex.zip
+  LTCTex.zip
+  "${CMAKE_CURRENT_SOURCE_DIR}/_deps"
+  SHA256 A389CBC501DA7FB24113EA4D2812C6B5D244EF6BBFC241DFFBB9527BAA76DC3C
+)
 
 Ubpa_AddTarget(
   MODE STATIC

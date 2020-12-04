@@ -3,11 +3,13 @@
 #include <Utopia/App/Editor/Components/Hierarchy.h>
 #include <Utopia/App/Editor/Components/Inspector.h>
 #include <Utopia/App/Editor/Components/ProjectViewer.h>
+#include <Utopia/App/Editor/Components/SystemController.h>
 
 #include <Utopia/App/Editor/Systems/HierarchySystem.h>
 #include <Utopia/App/Editor/Systems/InspectorSystem.h>
 #include <Utopia/App/Editor/Systems/ProjectViewerSystem.h>
 #include <Utopia/App/Editor/Systems/LoggerSystem.h>
+#include <Utopia/App/Editor/Systems/SystemControllerSystem.h>
 
 #include <Utopia/App/Editor/InspectorRegistry.h>
 
@@ -181,9 +183,6 @@ Editor::Editor(HINSTANCE hInstance)
 {}
 
 Editor::~Editor() {
-    if(!uDevice.IsNull())
-        FlushCommandQueue();
-
 	ImGUIMngr::Instance().Clear();
 
 	delete pImpl;
@@ -246,10 +245,16 @@ bool Editor::Impl::Init() {
 	AssetMngr::Instance().ImportAssetRecursively(L"..\\assets");
 	InitInspectorRegistry();
 
-	RsrcMngrDX12::Instance().GetUpload().Begin();
 	LoadTextures();
 	BuildShaders();
-	RsrcMngrDX12::Instance().GetUpload().End(pEditor->uCmdQueue.Get());
+	PipelineBase::InitDesc initDesc;
+	initDesc.device = pEditor->uDevice.Get();
+	initDesc.rtFormat = gameRTFormat;
+	initDesc.cmdQueue = pEditor->uCmdQueue.Get();
+	initDesc.numFrame = DX12App::NumFrameResources;
+	gamePipeline = std::make_unique<StdPipeline>(initDesc);
+	scenePipeline = std::make_unique<StdPipeline>(initDesc);
+	RsrcMngrDX12::Instance().CommitUploadAndDelete(pEditor->uCmdQueue.Get());
 
 	gameRT_SRV = Ubpa::UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Allocate(1);
 	gameRT_RTV = Ubpa::UDX12::DescriptorHeapMngr::Instance().GetRTVCpuDH()->Allocate(1);
@@ -273,22 +278,15 @@ bool Editor::Impl::Init() {
 
 	BuildWorld();
 
-	PipelineBase::InitDesc initDesc;
-	initDesc.device = pEditor->uDevice.Get();
-	initDesc.rtFormat = gameRTFormat;
-	initDesc.cmdQueue = pEditor->uCmdQueue.Get();
-	initDesc.numFrame = DX12App::NumFrameResources;
-	gamePipeline = std::make_unique<StdPipeline>(initDesc);
-	scenePipeline = std::make_unique<StdPipeline>(initDesc);
-
 	return true;
 }
 
 void Editor::Impl::OnGameResize() {
 	Ubpa::rgbaf background = { 0.f,0.f,0.f,1.f };
 	auto rtType = Ubpa::UDX12::FG::RsrcType::RT2D(gameRTFormat, gameWidth, (UINT)gameHeight, background.data());
+	const auto defaultHeapProp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
 	ThrowIfFailed(pEditor->uDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		&defaultHeapProp,
 		D3D12_HEAP_FLAG_NONE,
 		&rtType.desc,
 		D3D12_RESOURCE_STATE_PRESENT,
@@ -312,8 +310,9 @@ void Editor::Impl::OnGameResize() {
 void Editor::Impl::OnSceneResize() {
 	Ubpa::rgbaf background = { 0.f,0.f,0.f,1.f };
 	auto rtType = Ubpa::UDX12::FG::RsrcType::RT2D(sceneRTFormat, sceneWidth, (UINT)sceneHeight, background.data());
+	const auto defaultHeapProp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
 	ThrowIfFailed(pEditor->uDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		&defaultHeapProp,
 		D3D12_HEAP_FLAG_NONE,
 		&rtType.desc,
 		D3D12_RESOURCE_STATE_PRESENT,
@@ -341,9 +340,6 @@ void Editor::Impl::Update() {
 	ImGui_ImplWin32_NewFrame_Context(gameImGuiCtx, gamePos, (float)gameWidth, (float)gameHeight);
 	ImGui_ImplWin32_NewFrame_Context(sceneImGuiCtx, scenePos, (float)sceneWidth, (float)sceneHeight);
 	ImGui_ImplWin32_NewFrame_Shared();
-
-	auto& upload = RsrcMngrDX12::Instance().GetUpload();
-	upload.Begin();
 
 	{ // editor
 		ImGui::SetCurrentContext(editorImGuiCtx);
@@ -511,8 +507,10 @@ void Editor::Impl::Update() {
 			runningGameWorld = std::make_unique<Ubpa::UECS::World>(gameWorld);
 			if (auto hierarchy = editorWorld.entityMngr.GetSingleton<Hierarchy>())
 				hierarchy->world = runningGameWorld.get();
+			if (auto ctrl = editorWorld.entityMngr.GetSingleton<SystemController>())
+				ctrl->world = runningGameWorld.get();
 			curGameWorld = runningGameWorld.get();
-			runningGameWorld->systemMngr.Activate(runningGameWorld->systemMngr.GetIndex<LuaScriptQueueSystem>());
+			runningGameWorld->systemMngr.Activate(runningGameWorld->systemMngr.systemTraits.GetID(UECS::SystemTraits::StaticNameof<LuaScriptQueueSystem>()));
 			auto ctx = LuaCtxMngr::Instance().Register(runningGameWorld.get());
 			sol::state_view lua{ ctx->Main() };
 			lua["world"] = runningGameWorld.get();
@@ -532,6 +530,8 @@ void Editor::Impl::Update() {
 			runningGameWorld.reset();
 			if (auto hierarchy = editorWorld.entityMngr.GetSingleton<Hierarchy>())
 				hierarchy->world = &gameWorld;
+			if (auto ctrl = editorWorld.entityMngr.GetSingleton<SystemController>())
+				ctrl->world = &gameWorld;
 			{
 				LuaCtxMngr::Instance().Unregister(w);
 			}
@@ -564,16 +564,13 @@ void Editor::Impl::Update() {
 	cmdAlloc->Reset();
 
 	ThrowIfFailed(pEditor->uGCmdList->Reset(cmdAlloc, nullptr));
-	auto& deleteBatch = RsrcMngrDX12::Instance().GetDeleteBatch();
 
-	auto UpdateRenderResource = [&](const Ubpa::UECS::World* w) {
-		w->RunEntityJob([&](const MeshFilter* meshFilter, const MeshRenderer* meshRenderer) {
+	auto UpdateRenderResource = [&](Ubpa::UECS::World* w) {
+		w->RunEntityJob([&](MeshFilter* meshFilter, const MeshRenderer* meshRenderer) {
 			if (!meshFilter->mesh || meshRenderer->materials.empty())
 				return;
 
 			RsrcMngrDX12::Instance().RegisterMesh(
-				upload,
-				deleteBatch,
 				pEditor->uGCmdList.Get(),
 				*meshFilter->mesh
 			);
@@ -584,31 +581,27 @@ void Editor::Impl::Update() {
 				for (const auto& [name, property] : material->properties) {
 					if (std::holds_alternative<std::shared_ptr<const Texture2D>>(property)) {
 						RsrcMngrDX12::Instance().RegisterTexture2D(
-							RsrcMngrDX12::Instance().GetUpload(),
 							*std::get<std::shared_ptr<const Texture2D>>(property)
 						);
 					}
 					else if (std::holds_alternative<std::shared_ptr<const TextureCube>>(property)) {
 						RsrcMngrDX12::Instance().RegisterTextureCube(
-							RsrcMngrDX12::Instance().GetUpload(),
 							*std::get<std::shared_ptr<const TextureCube>>(property)
 						);
 					}
 				}
 			}
-			}, false);
+		}, false);
 
 		if (auto skybox = w->entityMngr.GetSingleton<Skybox>(); skybox && skybox->material) {
 			for (const auto& [name, property] : skybox->material->properties) {
 				if (std::holds_alternative<std::shared_ptr<const Texture2D>>(property)) {
 					RsrcMngrDX12::Instance().RegisterTexture2D(
-						RsrcMngrDX12::Instance().GetUpload(),
 						*std::get<std::shared_ptr<const Texture2D>>(property)
 					);
 				}
 				else if (std::holds_alternative<std::shared_ptr<const TextureCube>>(property)) {
 					RsrcMngrDX12::Instance().RegisterTextureCube(
-						RsrcMngrDX12::Instance().GetUpload(),
 						*std::get<std::shared_ptr<const TextureCube>>(property)
 					);
 				}
@@ -619,10 +612,9 @@ void Editor::Impl::Update() {
 	UpdateRenderResource(&sceneWorld);
 
 	// commit upload, delete ...
-	upload.End(pEditor->uCmdQueue.Get());
 	pEditor->uGCmdList->Close();
 	pEditor->uCmdQueue.Execute(pEditor->uGCmdList.Get());
-	deleteBatch.Commit(pEditor->uDevice.Get(), pEditor->uCmdQueue.Get());
+	RsrcMngrDX12::Instance().CommitUploadAndDelete(pEditor->uCmdQueue.Get());
 
 	{
 		std::vector<PipelineBase::CameraData> gameCameras;
@@ -662,7 +654,8 @@ void Editor::Impl::Draw() {
 		if (gameRT) {
 			gamePipeline->Render(gameRT.Get());
 			pEditor->uGCmdList.ResourceBarrierTransition(gameRT.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-			pEditor->uGCmdList->OMSetRenderTargets(1, &gameRT_RTV.GetCpuHandle(), FALSE, NULL);
+			const auto gameRTHandle = gameRT_RTV.GetCpuHandle();
+			pEditor->uGCmdList->OMSetRenderTargets(1, &gameRTHandle, FALSE, NULL);
 			pEditor->uGCmdList.SetDescriptorHeaps(Ubpa::UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->GetDescriptorHeap());
 			ImGui::Render();
 			ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), pEditor->uGCmdList.Get());
@@ -677,7 +670,8 @@ void Editor::Impl::Draw() {
 		if (sceneRT) {
 			scenePipeline->Render(sceneRT.Get());
 			pEditor->uGCmdList.ResourceBarrierTransition(sceneRT.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-			pEditor->uGCmdList->OMSetRenderTargets(1, &sceneRT_RTV.GetCpuHandle(), FALSE, NULL);
+			const auto sceneRTHandle = sceneRT_RTV.GetCpuHandle();
+			pEditor->uGCmdList->OMSetRenderTargets(1, &sceneRTHandle, FALSE, NULL);
 			pEditor->uGCmdList.SetDescriptorHeaps(Ubpa::UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->GetDescriptorHeap());
 			ImGui::Render();
 			ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), pEditor->uGCmdList.Get());
@@ -692,7 +686,8 @@ void Editor::Impl::Draw() {
 
 		pEditor->uGCmdList.ResourceBarrierTransition(pEditor->CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		pEditor->uGCmdList->ClearRenderTargetView(pEditor->CurrentBackBufferView(), DirectX::Colors::Black, 0, NULL);
-		pEditor->uGCmdList->OMSetRenderTargets(1, &pEditor->CurrentBackBufferView(), FALSE, NULL);
+		const auto curBack = pEditor->CurrentBackBufferView();
+		pEditor->uGCmdList->OMSetRenderTargets(1, &curBack, FALSE, NULL);
 		pEditor->uGCmdList.SetDescriptorHeaps(Ubpa::UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->GetDescriptorHeap());
 		ImGui::Render();
 		ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), pEditor->uGCmdList.Get());
@@ -731,6 +726,7 @@ void Editor::Impl::InitInspectorRegistry() {
 		Rotation,
 		RotationEuler,
 		Scale,
+		NonUniformScale,
 		Translation,
 		WorldToLocal,
 
@@ -743,7 +739,7 @@ void Editor::Impl::InitInspectorRegistry() {
 }
 
 void Editor::Impl::InitWorld(Ubpa::UECS::World& w) {
-	auto indices = w.systemMngr.Register<
+	auto indices = w.systemMngr.systemTraits.Register<
 		// transform
 		LocalToParentSystem,
 		RotationEulerSystem,
@@ -760,11 +756,12 @@ void Editor::Impl::InitWorld(Ubpa::UECS::World& w) {
 		// editor
 		HierarchySystem,
 		InspectorSystem,
-		ProjectViewerSystem
+		ProjectViewerSystem,
+		SystemControllerSystem
 	>();
 	for (auto idx : indices)
 		w.systemMngr.Activate(idx);
-	w.systemMngr.Register<LuaScriptQueueSystem>();
+	w.systemMngr.systemTraits.Register<LuaScriptQueueSystem>();
 
 	w.entityMngr.cmptTraits.Register<
 		// transform
@@ -775,6 +772,7 @@ void Editor::Impl::InitWorld(Ubpa::UECS::World& w) {
 		Rotation,
 		RotationEuler,
 		Scale,
+		NonUniformScale,
 		Translation,
 		WorldToLocal,
 
@@ -795,7 +793,8 @@ void Editor::Impl::InitWorld(Ubpa::UECS::World& w) {
 		// editor
 		Hierarchy,
 		Inspector,
-		ProjectViewer
+		ProjectViewer,
+		SystemController
 	>();
 }
 
@@ -820,6 +819,7 @@ void Editor::Impl::BuildWorld() {
 		Rotation,
 		RotationEuler,
 		Scale,
+		NonUniformScale,
 		Translation,
 		WorldToLocal,
 
@@ -880,10 +880,13 @@ void Editor::Impl::BuildWorld() {
 			auto [e, hierarchy] = editorWorld.entityMngr.Create<Hierarchy>();
 			hierarchy->world = &gameWorld;
 		}
+		{ // system controller
+			auto [e, systemCtrl] = editorWorld.entityMngr.Create<SystemController>();
+			systemCtrl->world = &gameWorld;
+		}
 		editorWorld.entityMngr.Create<Inspector>();
 		editorWorld.entityMngr.Create<ProjectViewer>();
-		auto [logSys] = editorWorld.systemMngr.Register<LoggerSystem>();
-		editorWorld.systemMngr.Activate(logSys);
+		editorWorld.systemMngr.RegisterAndActivate<LoggerSystem, SystemControllerSystem>();
 	}
 }
 
@@ -892,7 +895,6 @@ void Editor::Impl::LoadTextures() {
 	for (const auto& guid : tex2dGUIDs) {
 		const auto& path = AssetMngr::Instance().GUIDToAssetPath(guid);
 		RsrcMngrDX12::Instance().RegisterTexture2D(
-			RsrcMngrDX12::Instance().GetUpload(),
 			*AssetMngr::Instance().LoadAsset<Texture2D>(path)
 		);
 	}
@@ -901,7 +903,6 @@ void Editor::Impl::LoadTextures() {
 	for (const auto& guid : texcubeGUIDs) {
 		const auto& path = AssetMngr::Instance().GUIDToAssetPath(guid);
 		RsrcMngrDX12::Instance().RegisterTextureCube(
-			RsrcMngrDX12::Instance().GetUpload(),
 			*AssetMngr::Instance().LoadAsset<TextureCube>(path)
 		);
 	}

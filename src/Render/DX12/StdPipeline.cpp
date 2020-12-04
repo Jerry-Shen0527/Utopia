@@ -1,5 +1,7 @@
 #include <Utopia/Render/DX12/StdPipeline.h>
 
+#include "../_deps/LTCTex.h"
+
 #include <Utopia/Render/DX12/RsrcMngrDX12.h>
 #include <Utopia/Render/DX12/MeshLayoutMngr.h>
 #include <Utopia/Render/DX12/ShaderCBMngrDX12.h>
@@ -100,7 +102,7 @@ struct StdPipeline::Impl {
 		float f2;
 
 		struct Spot {
-			static constexpr auto pCosHalfInnerSpotAngle  = &ShaderLight::f0;
+			static constexpr auto pCosHalfInnerSpotAngle = &ShaderLight::f0;
 			static constexpr auto pCosHalfOuterSpotAngle = &ShaderLight::f1;
 		};
 		struct Rect {
@@ -108,7 +110,8 @@ struct StdPipeline::Impl {
 			static constexpr auto pHeight = &ShaderLight::f1;
 		};
 		struct Disk {
-			static constexpr auto pRadius = &ShaderLight::f0;
+			static constexpr auto pWidth  = &ShaderLight::f0;
+			static constexpr auto pHeight = &ShaderLight::f1;
 		};
 	};
 	struct LightArray {
@@ -138,7 +141,7 @@ struct StdPipeline::Impl {
 
 	struct IBLData {
 		D3D12_GPU_DESCRIPTOR_HANDLE lastSkybox{ 0 };
-		size_t nextIdx{ static_cast<size_t>(-1) };
+		UINT nextIdx{ static_cast<UINT>(-1) };
 
 		static constexpr size_t IrradianceMapSize = 128;
 		static constexpr size_t PreFilterMapSize = 512;
@@ -185,12 +188,16 @@ struct StdPipeline::Impl {
 	static constexpr char StdPipeline_cbPerCamera[] = "StdPipeline_cbPerCamera";
 	static constexpr char StdPipeline_cbLightArray[] = "StdPipeline_cbLightArray";
 	static constexpr char StdPipeline_srvIBL[] = "StdPipeline_IrradianceMap";
+	static constexpr char StdPipeline_srvLTC[] = "StdPipeline_LTC0";
 
 	const std::set<std::string_view> commonCBs{
 		StdPipeline_cbPerObject,
 		StdPipeline_cbPerCamera,
 		StdPipeline_cbLightArray
 	};
+
+	Texture2D ltcTexes[2];
+	UDX12::DescriptorHeapAllocation ltcHandles; // 2
 
 	RenderContext renderContext;
 	D3D12_GPU_DESCRIPTOR_HANDLE defaultSkybox;
@@ -250,9 +257,32 @@ StdPipeline::Impl::~Impl() {
 		UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Free(std::move(data->SRVDH));
 	}
 	UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Free(std::move(defaultIBLSRVDH));
+	RsrcMngrDX12::Instance().UnregisterTexture2D(ltcTexes[0]);
+	RsrcMngrDX12::Instance().UnregisterTexture2D(ltcTexes[1]);
+	UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Free(std::move(ltcHandles));
 }
 
 void StdPipeline::Impl::BuildTextures() {
+	ltcTexes[0].image = std::make_shared<Image>(LTCTex::SIZE, LTCTex::SIZE, 4, LTCTex::data1);
+	ltcTexes[1].image = std::make_shared<Image>(LTCTex::SIZE, LTCTex::SIZE, 4, LTCTex::data2);
+	RsrcMngrDX12::Instance().RegisterTexture2D(ltcTexes[0]);
+	RsrcMngrDX12::Instance().RegisterTexture2D(ltcTexes[1]);
+	ltcHandles = UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Allocate(2);
+	auto ltc0 = RsrcMngrDX12::Instance().GetTexture2DResource(ltcTexes[0]);
+	auto ltc1 = RsrcMngrDX12::Instance().GetTexture2DResource(ltcTexes[1]);
+	const auto ltc0SRVDesc = UDX12::Desc::SRV::Tex2D(ltc0->GetDesc().Format);
+	const auto ltc1SRVDesc = UDX12::Desc::SRV::Tex2D(ltc1->GetDesc().Format);
+	initDesc.device->CreateShaderResourceView(
+		ltc0,
+		&ltc0SRVDesc,
+		ltcHandles.GetCpuHandle(static_cast<uint32_t>(0))
+	);
+	initDesc.device->CreateShaderResourceView(
+		ltc1,
+		&ltc1SRVDesc,
+		ltcHandles.GetCpuHandle(static_cast<uint32_t>(1))
+	);
+
 	auto skyboxBlack = AssetMngr::Instance().LoadAsset<Material>(LR"(..\assets\_internal\materials\skyBlack.mat)");
 	auto blackTexCube = std::get<std::shared_ptr<const TextureCube>>(skyboxBlack->properties.at("gSkybox"));
 	auto blackTexCubeRsrc = RsrcMngrDX12::Instance().GetTextureCubeResource(*blackTexCube);
@@ -297,8 +327,9 @@ void StdPipeline::Impl::BuildFrameResources() {
 				IBLData::IrradianceMapSize, IBLData::IrradianceMapSize,
 				1, DXGI_FORMAT_R32G32B32A32_FLOAT
 			);
+			const auto defaultHeapProp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
 			initDesc.device->CreateCommittedResource(
-				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+				&defaultHeapProp,
 				D3D12_HEAP_FLAG_NONE,
 				&rsrcDesc,
 				D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -317,8 +348,9 @@ void StdPipeline::Impl::BuildFrameResources() {
 				IBLData::PreFilterMapSize, IBLData::PreFilterMapSize,
 				IBLData::PreFilterMapMipLevels, DXGI_FORMAT_R32G32B32A32_FLOAT
 			);
+			const auto defaultHeapProp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
 			initDesc.device->CreateCommittedResource(
-				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+				&defaultHeapProp,
 				D3D12_HEAP_FLAG_NONE,
 				&rsrcDesc,
 				D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -605,7 +637,7 @@ void StdPipeline::Impl::UpdateRenderContext(
 							continue;
 						RenderContext::EntityData data;
 						data.l2w = L2Ws[i].value;
-						data.w2l = W2Ls ? W2Ls[i].value : L2Ws[i].value.inverse();
+						data.w2l = !W2Ls.empty() ? W2Ls[i].value : L2Ws[i].value.inverse();
 						renderContext.entity2data.emplace_hint(target, std::pair{ obj.entity.Idx(), data });
 					}
 				},
@@ -628,24 +660,26 @@ void StdPipeline::Impl::UpdateRenderContext(
 		renderContext.lights.rectLightNum = 0;
 		renderContext.lights.diskLightNum = 0;
 
+		UECS::ArchetypeFilter filter;
+		filter.all = { UECS::CmptAccessType::Of<UECS::Latest<LocalToWorld>> };
 		for (auto world : worlds) {
 			world->RunEntityJob(
 				[&](const Light* light) {
 					switch (light->type)
 					{
-					case LightType::Directional:
+					case Light::Type::Directional:
 						renderContext.lights.diectionalLightNum++;
 						break;
-					case LightType::Point:
+					case Light::Type::Point:
 						renderContext.lights.pointLightNum++;
 						break;
-					case LightType::Spot:
+					case Light::Type::Spot:
 						renderContext.lights.spotLightNum++;
 						break;
-					case LightType::Rect:
+					case Light::Type::Rect:
 						renderContext.lights.rectLightNum++;
 						break;
-					case LightType::Disk:
+					case Light::Type::Disk:
 						renderContext.lights.diskLightNum++;
 						break;
 					default:
@@ -653,7 +687,8 @@ void StdPipeline::Impl::UpdateRenderContext(
 						break;
 					}
 				},
-				false
+				false,
+				filter
 			);
 		}
 		
@@ -672,21 +707,21 @@ void StdPipeline::Impl::UpdateRenderContext(
 				[&](const Light* light, const LocalToWorld* l2w) {
 					switch (light->type)
 					{
-					case LightType::Directional:
+					case Light::Type::Directional:
 						renderContext.lights.lights[cur_diectionalLight].color = light->color * light->intensity;
-						renderContext.lights.lights[cur_diectionalLight].dir = (l2w->value * vecf3{ 0,0,1 }).normalize();
+						renderContext.lights.lights[cur_diectionalLight].dir = (l2w->value * vecf3{ 0,0,1 }).safe_normalize();
 						cur_diectionalLight++;
 						break;
-					case LightType::Point:
+					case Light::Type::Point:
 						renderContext.lights.lights[cur_pointLight].color = light->color * light->intensity;
 						renderContext.lights.lights[cur_pointLight].position = l2w->value * pointf3{ 0.f };
 						renderContext.lights.lights[cur_pointLight].range = light->range;
 						cur_pointLight++;
 						break;
-					case LightType::Spot:
+					case Light::Type::Spot:
 						renderContext.lights.lights[cur_spotLight].color = light->color * light->intensity;
 						renderContext.lights.lights[cur_spotLight].position = l2w->value * pointf3{ 0.f };
-						renderContext.lights.lights[cur_spotLight].dir = (l2w->value * vecf3{ 0,0,1 }).normalize();
+						renderContext.lights.lights[cur_spotLight].dir = (l2w->value * vecf3{ 0,1,0 }).safe_normalize();
 						renderContext.lights.lights[cur_spotLight].range = light->range;
 						renderContext.lights.lights[cur_spotLight].*
 							ShaderLight::Spot::pCosHalfInnerSpotAngle = std::cos(to_radian(light->innerSpotAngle) / 2.f);
@@ -694,11 +729,11 @@ void StdPipeline::Impl::UpdateRenderContext(
 							ShaderLight::Spot::pCosHalfOuterSpotAngle = std::cos(to_radian(light->outerSpotAngle) / 2.f);
 						cur_spotLight++;
 						break;
-					case LightType::Rect:
+					case Light::Type::Rect:
 						renderContext.lights.lights[cur_rectLight].color = light->color * light->intensity;
 						renderContext.lights.lights[cur_rectLight].position = l2w->value * pointf3{ 0.f };
-						renderContext.lights.lights[cur_rectLight].dir = (l2w->value * vecf3{ 0,0,1 }).normalize();
-						renderContext.lights.lights[cur_rectLight].horizontal = (l2w->value * vecf3{ 1,0,0 }).normalize();
+						renderContext.lights.lights[cur_rectLight].dir = (l2w->value * vecf3{ 0,1,0 }).safe_normalize();
+						renderContext.lights.lights[cur_rectLight].horizontal = (l2w->value * vecf3{ 1,0,0 }).safe_normalize();
 						renderContext.lights.lights[cur_rectLight].range = light->range;
 						renderContext.lights.lights[cur_rectLight].*
 							ShaderLight::Rect::pWidth = light->width;
@@ -706,13 +741,16 @@ void StdPipeline::Impl::UpdateRenderContext(
 							ShaderLight::Rect::pHeight = light->height;
 						cur_rectLight++;
 						break;
-					case LightType::Disk:
+					case Light::Type::Disk:
 						renderContext.lights.lights[cur_diskLight].color = light->color * light->intensity;
 						renderContext.lights.lights[cur_diskLight].position = l2w->value * pointf3{ 0.f };
-						renderContext.lights.lights[cur_diskLight].dir = (l2w->value * vecf3{ 0,0,1 }).normalize();
+						renderContext.lights.lights[cur_diskLight].dir = (l2w->value * vecf3{ 0,1,0 }).safe_normalize();
+						renderContext.lights.lights[cur_diskLight].horizontal = (l2w->value * vecf3{ 1,0,0 }).safe_normalize();
 						renderContext.lights.lights[cur_diskLight].range = light->range;
 						renderContext.lights.lights[cur_diskLight].*
-							ShaderLight::Disk::pRadius = light->radius;
+							ShaderLight::Disk::pWidth = light->width;
+						renderContext.lights.lights[cur_diskLight].*
+							ShaderLight::Disk::pHeight = light->height;
 						cur_diskLight++;
 						break;
 					default:
@@ -1029,9 +1067,10 @@ void StdPipeline::Impl::Render(const ResizeData& resizeData, ID3D12Resource* rtb
 
 				cmdList->SetGraphicsRootDescriptorTable(0, renderContext.skybox);
 				//for (UINT i = 0; i < 6; i++) {
-				UINT i = iblData->nextIdx;
+				UINT i = static_cast<UINT>(iblData->nextIdx);
 				// Specify the buffers we are going to render to.
-				cmdList->OMSetRenderTargets(1, &iblData->RTVsDH.GetCpuHandle(i), false, nullptr);
+				const auto iblRTVHandle = iblData->RTVsDH.GetCpuHandle(i);
+				cmdList->OMSetRenderTargets(1, &iblRTVHandle, false, nullptr);
 				auto address = buffer->GetResource()->GetGPUVirtualAddress()
 					+ i * UDX12::Util::CalcConstantBufferByteSize(sizeof(QuadPositionLs));
 				cmdList->SetGraphicsRootConstantBufferView(1, address);
@@ -1051,7 +1090,7 @@ void StdPipeline::Impl::Render(const ResizeData& resizeData, ID3D12Resource* rtb
 				cmdList->SetGraphicsRootDescriptorTable(0, renderContext.skybox);
 				//size_t size = Impl::IBLData::PreFilterMapSize;
 				//for (UINT mip = 0; mip < Impl::IBLData::PreFilterMapMipLevels; mip++) {
-				UINT mip = (iblData->nextIdx - 6) / 6;
+				UINT mip = static_cast<UINT>((iblData->nextIdx - 6) / 6);
 				size_t size = Impl::IBLData::PreFilterMapSize >> mip;
 				auto mipinfo = buffer->GetResource()->GetGPUVirtualAddress()
 					+ 6 * UDX12::Util::CalcConstantBufferByteSize(sizeof(QuadPositionLs))
@@ -1076,7 +1115,8 @@ void StdPipeline::Impl::Render(const ResizeData& resizeData, ID3D12Resource* rtb
 				cmdList->SetGraphicsRootConstantBufferView(1, positionLs);
 
 				// Specify the buffers we are going to render to.
-				cmdList->OMSetRenderTargets(1, &iblData->RTVsDH.GetCpuHandle(6 * (1 + mip) + i), false, nullptr);
+				const auto iblRTVHandle = iblData->RTVsDH.GetCpuHandle(6 * (1 + mip) + i);
+				cmdList->OMSetRenderTargets(1, &iblRTVHandle, false, nullptr);
 
 				cmdList->IASetVertexBuffers(0, 0, nullptr);
 				cmdList->IASetIndexBuffer(nullptr);
@@ -1127,15 +1167,17 @@ void StdPipeline::Impl::Render(const ResizeData& resizeData, ID3D12Resource* rtb
 			else
 				cmdList->SetGraphicsRootDescriptorTable(2, iblData->SRVDH.GetGpuHandle());
 
+			cmdList->SetGraphicsRootDescriptorTable(3, ltcHandles.GetGpuHandle());
+
 			auto cbLights = frameRsrcMngr.GetCurrentFrameResource()
 				->GetResource<ShaderCBMngrDX12>("ShaderCBMngrDX12")
 				.GetCommonBuffer()->GetResource()->GetGPUVirtualAddress() + renderContext.lightOffset;
-			cmdList->SetGraphicsRootConstantBufferView(3, cbLights);
+			cmdList->SetGraphicsRootConstantBufferView(4, cbLights);
 
 			auto cbPerCamera = frameRsrcMngr.GetCurrentFrameResource()
 				->GetResource<ShaderCBMngrDX12>("ShaderCBMngrDX12")
 				.GetCommonBuffer()->GetResource();
-			cmdList->SetGraphicsRootConstantBufferView(4, cbPerCamera->GetGPUVirtualAddress());
+			cmdList->SetGraphicsRootConstantBufferView(5, cbPerCamera->GetGPUVirtualAddress());
 
 			cmdList->IASetVertexBuffers(0, 0, nullptr);
 			cmdList->IASetIndexBuffer(nullptr);
@@ -1281,10 +1323,30 @@ void StdPipeline::Impl::DrawObjects(ID3D12GraphicsCommandList* cmdList, std::str
 
 		auto& meshGPUBuffer = RsrcMngrDX12::Instance().GetMeshGPUBuffer(*obj.mesh);
 		const auto& submesh = obj.mesh->GetSubMeshes().at(obj.submeshIdx);
-		cmdList->IASetVertexBuffers(0, 1, &meshGPUBuffer.VertexBufferView());
-		cmdList->IASetIndexBuffer(&meshGPUBuffer.IndexBufferView());
+		const auto meshVBView = meshGPUBuffer.VertexBufferView();
+		const auto meshIBView = meshGPUBuffer.IndexBufferView();
+		cmdList->IASetVertexBuffers(0, 1, &meshVBView);
+		cmdList->IASetIndexBuffer(&meshIBView);
 		// submesh.topology
-		cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		D3D12_PRIMITIVE_TOPOLOGY d3d12Topology;
+		switch (submesh.topology)
+		{
+		case Ubpa::Utopia::MeshTopology::Triangles:
+			d3d12Topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+			break;
+		case Ubpa::Utopia::MeshTopology::Lines:
+			d3d12Topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+			break;
+		case Ubpa::Utopia::MeshTopology::LineStrip:
+			d3d12Topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+			break;
+		case Ubpa::Utopia::MeshTopology::Points:
+			d3d12Topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+			break;
+		default:
+			break;
+		}
+		cmdList->IASetPrimitiveTopology(d3d12Topology);
 
 		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress =
 			commonBuffer->GetResource()->GetGPUVirtualAddress()
@@ -1297,7 +1359,8 @@ void StdPipeline::Impl::DrawObjects(ID3D12GraphicsCommandList* cmdList, std::str
 				{StdPipeline_cbLightArray, lightCBAdress}
 			},
 			{
-				{StdPipeline_srvIBL, ibl}
+				{StdPipeline_srvIBL, ibl},
+				{StdPipeline_srvLTC, ltcHandles.GetGpuHandle()}
 			}
 		);
 		if (shader->passes[obj.passIdx].renderState.stencilState.enable)

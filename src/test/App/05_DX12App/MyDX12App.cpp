@@ -63,7 +63,7 @@ struct AnimateMeshSystem {
 			if (time->elapsedTime < 10.f)
 				return;
 
-			w->systemMngr.Deactivate(w->systemMngr.GetIndex<AnimateMeshSystem>());
+			w->systemMngr.Deactivate(w->systemMngr.systemTraits.GetID(Ubpa::UECS::SystemTraits::StaticNameof<AnimateMeshSystem>()));
 		});
 	}
 };
@@ -179,9 +179,6 @@ MyDX12App::MyDX12App(HINSTANCE hInstance)
 }
 
 MyDX12App::~MyDX12App() {
-    if(!uDevice.IsNull())
-        FlushCommandQueue();
-
 	Ubpa::Utopia::ImGUIMngr::Instance().Clear();
 }
 
@@ -199,11 +196,9 @@ bool MyDX12App::Init() {
 
 	BuildWorld();
 
-	Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload().Begin();
 	LoadTextures();
 	BuildShaders();
 	BuildMaterials();
-	Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload().End(uCmdQueue.Get());
 
 	Ubpa::Utopia::PipelineBase::InitDesc initDesc;
 	initDesc.device = uDevice.Get();
@@ -211,6 +206,7 @@ bool MyDX12App::Init() {
 	initDesc.cmdQueue = uCmdQueue.Get();
 	initDesc.numFrame = NumFrameResources;
 	pipeline = std::make_unique<Ubpa::Utopia::StdPipeline>(initDesc);
+	Ubpa::Utopia::RsrcMngrDX12::Instance().CommitUploadAndDelete(uCmdQueue.Get());
 
 	// Do the initial resize code.
 	OnResize();
@@ -234,9 +230,6 @@ void MyDX12App::Update() {
 	ImGui_ImplDX12_NewFrame();
 	ImGui_ImplWin32_NewFrame_Context(gameImGuiCtx, { 0,0 }, (float)mClientWidth, (float)mClientHeight);
 	ImGui_ImplWin32_NewFrame_Shared();
-
-	auto& upload = Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload();
-	upload.Begin();
 
 	ImGui::SetCurrentContext(gameImGuiCtx);
 	ImGui::NewFrame();
@@ -290,17 +283,14 @@ void MyDX12App::Update() {
 	cmdAlloc->Reset();
 
 	ThrowIfFailed(uGCmdList->Reset(cmdAlloc, nullptr));
-	auto& deleteBatch = Ubpa::Utopia::RsrcMngrDX12::Instance().GetDeleteBatch();
 
 	// update mesh
 	
-	world.RunEntityJob([&](const Ubpa::Utopia::MeshFilter* meshFilter, const Ubpa::Utopia::MeshRenderer* meshRenderer) {
+	world.RunEntityJob([&](Ubpa::Utopia::MeshFilter* meshFilter, const Ubpa::Utopia::MeshRenderer* meshRenderer) {
 		if (!meshFilter->mesh || meshRenderer->materials.empty())
 			return;
 
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterMesh(
-			upload,
-			deleteBatch,
 			uGCmdList.Get(),
 			*meshFilter->mesh
 		);
@@ -311,13 +301,11 @@ void MyDX12App::Update() {
 			for (const auto& [name, property] : material->properties) {
 				if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)) {
 					Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTexture2D(
-						Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 						*std::get<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)
 					);
 				}
 				else if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)) {
 					Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTextureCube(
-						Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 						*std::get<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)
 					);
 				}
@@ -329,13 +317,11 @@ void MyDX12App::Update() {
 		for (const auto& [name, property] : skybox->material->properties) {
 			if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)) {
 				Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTexture2D(
-					Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 					*std::get<std::shared_ptr<const Ubpa::Utopia::Texture2D>>(property)
 				);
 			}
 			else if (std::holds_alternative<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)) {
 				Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTextureCube(
-					Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 					*std::get<std::shared_ptr<const Ubpa::Utopia::TextureCube>>(property)
 				);
 			}
@@ -343,10 +329,9 @@ void MyDX12App::Update() {
 	}
 
 	// commit upload, delete ...
-	upload.End(uCmdQueue.Get());
 	uGCmdList->Close();
 	uCmdQueue.Execute(uGCmdList.Get());
-	deleteBatch.Commit(uDevice.Get(), uCmdQueue.Get());
+	Ubpa::Utopia::RsrcMngrDX12::Instance().CommitUploadAndDelete(uCmdQueue.Get());
 
 	std::vector<Ubpa::Utopia::PipelineBase::CameraData> gameCameras;
 	Ubpa::UECS::ArchetypeFilter camFilter{ {Ubpa::UECS::CmptAccessType::Of<Ubpa::Utopia::Camera>} };
@@ -365,8 +350,9 @@ void MyDX12App::Draw() {
 
 	pipeline->Render(CurrentBackBuffer());
 
+	const auto curBack = CurrentBackBufferView();
 	uGCmdList.ResourceBarrierTransition(CurrentBackBuffer(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
-	uGCmdList->OMSetRenderTargets(1, &CurrentBackBufferView(), FALSE, NULL);
+	uGCmdList->OMSetRenderTargets(1, &curBack, FALSE, NULL);
 	uGCmdList.SetDescriptorHeaps(Ubpa::UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->GetDescriptorHeap());
 	ImGui::Render();
 	ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), uGCmdList.Get());
@@ -446,7 +432,7 @@ void MyDX12App::UpdateCamera()
 }
 
 void MyDX12App::BuildWorld() {
-	auto indices = world.systemMngr.Register<
+	auto systemIDs = world.systemMngr.systemTraits.Register<
 		Ubpa::Utopia::CameraSystem,
 		Ubpa::Utopia::LocalToParentSystem,
 		Ubpa::Utopia::RotationEulerSystem,
@@ -456,8 +442,8 @@ void MyDX12App::BuildWorld() {
 		Ubpa::Utopia::WorldTimeSystem,
 		AnimateMeshSystem
 	>();
-	for (auto idx : indices)
-		world.systemMngr.Activate(idx);
+	for (auto ID : systemIDs)
+		world.systemMngr.Activate(ID);
 
 	{ // skybox
 		auto [e, skybox] = world.entityMngr.Create<Ubpa::Utopia::Skybox>();
@@ -505,7 +491,6 @@ void MyDX12App::LoadTextures() {
 	for (const auto& guid : tex2dGUIDs) {
 		const auto& path = Ubpa::Utopia::AssetMngr::Instance().GUIDToAssetPath(guid);
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTexture2D(
-			Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 			*Ubpa::Utopia::AssetMngr::Instance().LoadAsset<Ubpa::Utopia::Texture2D>(path)
 		);
 	}
@@ -514,7 +499,6 @@ void MyDX12App::LoadTextures() {
 	for (const auto& guid : texcubeGUIDs) {
 		const auto& path = Ubpa::Utopia::AssetMngr::Instance().GUIDToAssetPath(guid);
 		Ubpa::Utopia::RsrcMngrDX12::Instance().RegisterTextureCube(
-			Ubpa::Utopia::RsrcMngrDX12::Instance().GetUpload(),
 			*Ubpa::Utopia::AssetMngr::Instance().LoadAsset<Ubpa::Utopia::TextureCube>(path)
 		);
 	}

@@ -42,6 +42,7 @@ struct RsrcMngrDX12::Impl {
 	bool isInit{ false };
 	ID3D12Device* device{ nullptr };
 	DirectX::ResourceUploadBatch* upload{ nullptr };
+	bool hasUpload = false;
 	UDX12::ResourceDeleteBatch deleteBatch;
 
 	unordered_map<size_t, Texture2DGPUData> texture2DMap;
@@ -120,13 +121,17 @@ RsrcMngrDX12& RsrcMngrDX12::Init(ID3D12Device* device) {
 
 	pImpl->device = device;
 	pImpl->upload = new DirectX::ResourceUploadBatch{ device };
+	pImpl->upload->Begin();
 
 	pImpl->isInit = true;
 	return *this;
 }
 
-void RsrcMngrDX12::Clear() {
+void RsrcMngrDX12::Clear(ID3D12CommandQueue* cmdQueue) {
 	assert(pImpl->isInit);
+
+	pImpl->upload->End(cmdQueue);
+	pImpl->deleteBatch.Commit(pImpl->device, cmdQueue);
 
 	for (auto& [name, tex] : pImpl->texture2DMap) {
 		UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Free(move(tex.allocationSRV));
@@ -161,12 +166,13 @@ void RsrcMngrDX12::Clear() {
 	pImpl->isInit = false;
 }
 
-DirectX::ResourceUploadBatch& RsrcMngrDX12::GetUpload() const {
-	return *pImpl->upload;
-}
+void RsrcMngrDX12::CommitUploadAndDelete(ID3D12CommandQueue* cmdQueue) {
+	if (pImpl->hasUpload) {
+		pImpl->upload->End(cmdQueue);
+		pImpl->upload->Begin();
+	}
 
-UDX12::ResourceDeleteBatch& RsrcMngrDX12::GetDeleteBatch() const {
-	return pImpl->deleteBatch;
+	pImpl->deleteBatch.Commit(pImpl->device, cmdQueue);
 }
 
 //RsrcMngrDX12& RsrcMngrDX12::RegisterTexture2D(
@@ -210,10 +216,7 @@ UDX12::ResourceDeleteBatch& RsrcMngrDX12::GetDeleteBatch() const {
 //	return *this;
 //}
 
-RsrcMngrDX12& RsrcMngrDX12::RegisterTexture2D(
-	DirectX::ResourceUploadBatch& upload,
-	const Texture2D& tex2D)
-{
+RsrcMngrDX12& RsrcMngrDX12::RegisterTexture2D(const Texture2D& tex2D) {
 	auto target = pImpl->texture2DMap.find(tex2D.GetInstanceID());
 	if (target != pImpl->texture2DMap.end())
 		return *this;
@@ -234,9 +237,10 @@ RsrcMngrDX12& RsrcMngrDX12::RegisterTexture2D(
 	data.RowPitch = tex2D.image->width * tex2D.image->channel * sizeof(float);
 	data.SlicePitch = tex2D.image->height* data.RowPitch; // this field is useless for texture 2d
 
+	pImpl->hasUpload = true;
 	DirectX::CreateTextureFromMemory(
 		pImpl->device,
-		upload,
+		*pImpl->upload,
 		tex2D.image->width.get(),
 		tex2D.image->height.get(),
 		channelMap[tex2D.image->channel - 1],
@@ -244,9 +248,10 @@ RsrcMngrDX12& RsrcMngrDX12::RegisterTexture2D(
 		&tex.resource
 	);
 
+	const auto tex2DSRVDesc = UDX12::Desc::SRV::Tex2D(tex.resource->GetDesc().Format);
 	pImpl->device->CreateShaderResourceView(
 		tex.resource,
-		&UDX12::Desc::SRV::Tex2D(tex.resource->GetDesc().Format),
+		&tex2DSRVDesc,
 		tex.allocationSRV.GetCpuHandle(static_cast<uint32_t>(0))
 	);
 
@@ -255,10 +260,18 @@ RsrcMngrDX12& RsrcMngrDX12::RegisterTexture2D(
 	return *this;
 }
 
-RsrcMngrDX12& RsrcMngrDX12::RegisterTextureCube(
-	DirectX::ResourceUploadBatch& upload,
-	const TextureCube& texcube
-) {
+RsrcMngrDX12& RsrcMngrDX12::UnregisterTexture2D(const Texture2D& tex2D) {
+	if (auto target = pImpl->texture2DMap.find(tex2D.GetInstanceID()); target != pImpl->texture2DMap.end()) {
+		auto& tex = target->second;
+		UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Free(move(tex.allocationSRV));
+		pImpl->deleteBatch.Add(tex.resource);
+		tex.resource = nullptr;
+		pImpl->texture2DMap.erase(target);
+	}
+	return *this;
+}
+
+RsrcMngrDX12& RsrcMngrDX12::RegisterTextureCube(const TextureCube& texcube) {
 	auto target = pImpl->textureCubeMap.find(texcube.GetInstanceID());
 	if (target != pImpl->textureCubeMap.end())
 		return *this;
@@ -285,23 +298,36 @@ RsrcMngrDX12& RsrcMngrDX12::RegisterTextureCube(
 		datas[i].SlicePitch = texcube.images[i]->height * datas[i].RowPitch; // this field is useless for texture 2d
 	}
 
+	pImpl->hasUpload = true;
 	UDX12::Util::CreateTexture2DArrayFromMemory(
 		pImpl->device,
-		upload,
+		*pImpl->upload,
 		w, h, 6,
 		channelMap[c-1],
 		datas.data(),
 		&tex.resource
 	);
 
+	const auto texCubeSRVDesc = UDX12::Desc::SRV::TexCube(tex.resource->GetDesc().Format);
 	pImpl->device->CreateShaderResourceView(
 		tex.resource,
-		&UDX12::Desc::SRV::TexCube(tex.resource->GetDesc().Format),
+		&texCubeSRVDesc,
 		tex.allocationSRV.GetCpuHandle(static_cast<uint32_t>(0))
 	);
 
 	pImpl->textureCubeMap.emplace_hint(target, std::make_pair(texcube.GetInstanceID(), move(tex)));
 
+	return *this;
+}
+
+RsrcMngrDX12& RsrcMngrDX12::UnregisterTextureCube(const TextureCube& texcube) {
+	if (auto target = pImpl->textureCubeMap.find(texcube.GetInstanceID()); target != pImpl->textureCubeMap.end()) {
+		auto& tex = target->second;
+		UDX12::DescriptorHeapMngr::Instance().GetCSUGpuDH()->Free(move(tex.allocationSRV));
+		pImpl->deleteBatch.Add(tex.resource);
+		tex.resource = nullptr;
+		pImpl->textureCubeMap.erase(target);
+	}
 	return *this;
 }
 
@@ -372,24 +398,9 @@ ID3D12Resource* RsrcMngrDX12::GetTextureCubeResource(const TextureCube& texCube)
 //	return pImpl->textureMap.find(tex2D.GetInstanceID())->second.allocationRTV;
 //}
 
-UDX12::MeshGPUBuffer& RsrcMngrDX12::RegisterMesh(
-	DirectX::ResourceUploadBatch& upload,
-	UDX12::ResourceDeleteBatch& deleteBatch,
-	ID3D12GraphicsCommandList* cmdList,
-	Mesh& mesh
-) {
+UDX12::MeshGPUBuffer& RsrcMngrDX12::RegisterMesh(ID3D12GraphicsCommandList* cmdList, Mesh& mesh) {
 	auto target = pImpl->meshMap.find(mesh.GetInstanceID());
 	if (target == pImpl->meshMap.end()) {
-		if (mesh.IsDirty())
-			mesh.UpdateVertexBuffer();
-
-		auto vb_data = mesh.GetVertexBufferData();
-		auto vb_count = (UINT)mesh.GetVertexBufferVertexCount();
-		auto vb_stride = (UINT)mesh.GetVertexBufferVertexStride();
-		auto ib_data = mesh.GetIndices().data();
-		auto ib_count = (UINT)mesh.GetIndices().size();
-		auto ib_format = DXGI_FORMAT_R32_UINT;
-
 		if (mesh.IsEditable()) {
 			auto [iter, success] = pImpl->meshMap.try_emplace(
 				mesh.GetInstanceID(),
@@ -405,9 +416,10 @@ UDX12::MeshGPUBuffer& RsrcMngrDX12::RegisterMesh(
 			return iter->second;
 		}
 		else {
+			pImpl->hasUpload = true;
 			auto [iter, success] = pImpl->meshMap.try_emplace(
 				mesh.GetInstanceID(),
-				pImpl->device, upload,
+				pImpl->device, *pImpl->upload,
 				mesh.GetVertexBufferData(),
 				(UINT)mesh.GetVertexBufferVertexCount(),
 				(UINT)mesh.GetVertexBufferVertexStride(),
@@ -416,15 +428,16 @@ UDX12::MeshGPUBuffer& RsrcMngrDX12::RegisterMesh(
 				DXGI_FORMAT_R32_UINT
 			);
 			assert(success);
+			mesh.ClearVertexBuffer();
 			return iter->second;
 		}
 	}
 	else {
 		auto& meshGpuBuffer = target->second;
-		if (!meshGpuBuffer.IsStatic()) {
+		if (meshGpuBuffer.IsStatic()) {
 			if (mesh.IsEditable()) {
+				meshGpuBuffer.ConvertToDynamic(pImpl->device);
 				if (mesh.IsDirty()) {
-					mesh.UpdateVertexBuffer();
 					meshGpuBuffer.Update(
 						pImpl->device, cmdList,
 						mesh.GetVertexBufferData(),
@@ -435,13 +448,28 @@ UDX12::MeshGPUBuffer& RsrcMngrDX12::RegisterMesh(
 						DXGI_FORMAT_R32_UINT
 					);
 				}
-				//else
-				//	;// do nothing
 			}
-			else {
+			else { // non-editable
 				if (mesh.IsDirty()) {
-					meshGpuBuffer.UpdateAndConvertToStatic(
-						deleteBatch,
+					meshGpuBuffer.ConvertToDynamic(pImpl->device);
+					meshGpuBuffer.Update(
+						pImpl->device, cmdList,
+						mesh.GetVertexBufferData(),
+						(UINT)mesh.GetVertexBufferVertexCount(),
+						(UINT)mesh.GetVertexBufferVertexStride(),
+						mesh.GetIndices().data(),
+						(UINT)mesh.GetIndices().size(),
+						DXGI_FORMAT_R32_UINT
+					);
+					meshGpuBuffer.ConvertToStatic(pImpl->deleteBatch);
+				}
+				mesh.ClearVertexBuffer();
+			}
+		}
+		else { // dynamic
+			if (mesh.IsEditable()) {
+				if (mesh.IsDirty()) {
+					meshGpuBuffer.Update(
 						pImpl->device, cmdList,
 						mesh.GetVertexBufferData(),
 						(UINT)mesh.GetVertexBufferVertexCount(),
@@ -451,16 +479,35 @@ UDX12::MeshGPUBuffer& RsrcMngrDX12::RegisterMesh(
 						DXGI_FORMAT_R32_UINT
 					);
 				}
-				else
-					meshGpuBuffer.ConvertToStatic();
+			}
+			else {
+				if (mesh.IsDirty()) {
+					meshGpuBuffer.Update(
+						pImpl->device, cmdList,
+						mesh.GetVertexBufferData(),
+						(UINT)mesh.GetVertexBufferVertexCount(),
+						(UINT)mesh.GetVertexBufferVertexStride(),
+						mesh.GetIndices().data(),
+						(UINT)mesh.GetIndices().size(),
+						DXGI_FORMAT_R32_UINT
+					);
+				}
+				mesh.ClearVertexBuffer();
+				meshGpuBuffer.ConvertToStatic(pImpl->deleteBatch);
 			}
 		}
-		else
-			assert(!mesh.IsEditable() && !mesh.IsDirty());
 
 		return meshGpuBuffer;
 	}
 	return pImpl->meshMap.find(mesh.GetInstanceID())->second;
+}
+
+RsrcMngrDX12& RsrcMngrDX12::UnregisterMesh(const Mesh& mesh) {
+	if (auto target = pImpl->meshMap.find(mesh.GetInstanceID()); target != pImpl->meshMap.end()) {
+		target->second.Delete(pImpl->deleteBatch);
+		pImpl->meshMap.erase(target);
+	}
+	return *this;
 }
 
 UDX12::MeshGPUBuffer& RsrcMngrDX12::GetMeshGPUBuffer(const Mesh& mesh) const {

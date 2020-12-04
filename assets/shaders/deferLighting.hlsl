@@ -1,11 +1,14 @@
+#define STD_PIPELINE_ENABLE_LTC
 #include "StdPipeline.hlsli"
+
 #include "PBR.hlsli"
 
 Texture2D    gbuffer0       : register(t0);
 Texture2D    gbuffer1       : register(t1);
 Texture2D    gbuffer2       : register(t2);
 Texture2D    gDepthStencil  : register(t3);
-STD_PIPELINE_SR_IBL(4); // cover 3 shader resource registers
+STD_PIPELINE_SR3_IBL(4);
+STD_PIPELINE_SR2_LTC(7);
 
 STD_PIPELINE_CB_LIGHT_ARRAY(0);
 
@@ -43,7 +46,7 @@ float4 PS(VertexOut pin) : SV_Target
 {
     float4 data0 = gbuffer0.Sample(gSamplerPointWrap, pin.TexC);
     float4 data1 = gbuffer1.Sample(gSamplerPointWrap, pin.TexC);
-    //float4 data2 = gbuffer2.Sample(gSamplerPointWrap, pin.TexC);
+    float4 data2 = gbuffer2.Sample(gSamplerPointWrap, pin.TexC);
     
 	float depth = gDepthStencil.Sample(gSamplerPointWrap, pin.TexC).r;
 	float4 posHC = float4(
@@ -56,6 +59,7 @@ float4 PS(VertexOut pin) : SV_Target
 	float3 posW = posHW.xyz / posHW.w;
 	
 	float3 albedo = data0.xyz;
+	float3 emission = data2.xyz;
 	float roughness = data0.w;
 	
 	float3 N = data1.xyz;
@@ -135,6 +139,42 @@ float4 PS(VertexOut pin) : SV_Target
 			/ (max(0.0001, dist2));
 		Lo += brdf * color * cos_theta;
 	}
+	offset += gSpotLightNum;
+	for (i = offset; i < offset + gRectLightNum; i++) {
+		float3 up = cross(gLights[i].dir, gLights[i].horizontal);
+
+		float3 halfWidthVec = gLights[i].horizontal * gLights[i].f0 / 2;
+		float3 halfHeightVec = up * gLights[i].f1 / 2;
+
+		float3 p0 = gLights[i].position - halfHeightVec - halfWidthVec;
+		float3 p1 = gLights[i].position - halfHeightVec + halfWidthVec;
+		float3 p2 = gLights[i].position + halfHeightVec + halfWidthVec;
+		float3 p3 = gLights[i].position + halfHeightVec - halfWidthVec;
+
+		float3 spec = LTC_Rect_Spec(N, V, posW, F0, roughness, p0, p1, p2, p3);
+		float3 diffuse = (1 - metalness) * albedo * (1 - F0)
+			* LTC_Rect_Diffuse(N, V, posW, roughness, p0, p1, p2, p3);
+
+		Lo += (spec + diffuse) / (2 * PI) * gLights[i].color;
+	}
+	offset += gRectLightNum;
+	for (i = offset; i < offset + gDiskLightNum; i++) {
+		float3 up = cross(gLights[i].dir, gLights[i].horizontal);
+
+		float3 halfWidthVec = gLights[i].horizontal * gLights[i].f0 / 2;
+		float3 halfHeightVec = up * gLights[i].f1 / 2;
+
+		float3 p0 = gLights[i].position - halfHeightVec - halfWidthVec;
+		float3 p1 = gLights[i].position - halfHeightVec + halfWidthVec;
+		float3 p2 = gLights[i].position + halfHeightVec + halfWidthVec;
+		//float3 p3 = gLights[i].position + halfHeightVec - halfWidthVec;
+
+		float3 spec = LTC_Disk_Spec(N, V, posW, F0, roughness, p0, p1, p2);
+		float3 diffuse = (1 - metalness) * albedo * (1 - F0)
+			* LTC_Disk_Diffuse(N, V, posW, roughness, p0, p1, p2);
+
+		Lo += (spec + diffuse) / (2 * PI) * gLights[i].color;
+	}
 	
 	float3 FrR = SchlickFrR(V, N, F0, roughness);
 	float3 kS = FrR;
@@ -150,6 +190,8 @@ float4 PS(VertexOut pin) : SV_Target
 	float3 specular = prefilterColor * (F0 * scale_bias.x + scale_bias.y);
 	
 	Lo += kD * diffuse + specular;
+
+	Lo += emission;
 	
     return float4(Lo, 1.0f);
 }
